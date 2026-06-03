@@ -1,78 +1,90 @@
 /**
  * Vienze Clothing Scraper - Main Orchestrator
  *
- * Scrapes all products from vienezeclo.com, generates image and text embeddings
- * using SigLIP (Xenova/siglip-base-patch16-384), and imports everything to Supabase.
+ * Smart flow:
+ * 1. Scrape all products
+ * 2. Compare against existing DB records
+ * 3. Only generate embeddings for new/changed products
+ * 4. Batch upsert in groups of 50
+ * 5. Handle stale products (delete after 2 missed runs)
+ * 6. Print run summary
  */
 import "dotenv/config";
 import { VienzeScraper } from "./scraper.js";
 import { initEmbeddings, getImageEmbedding, getTextEmbedding } from "./embeddings.js";
-import { upsertProduct, testConnection } from "./supabaseClient.js";
-import { RawProduct } from "./types.js";
+import { DatabaseManager } from "./supabaseClient.js";
+import type { RawProduct } from "./types.js";
 
 const CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY || "3", 10);
 const DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || "1000", 10);
 const MAX_PRODUCTS = parseInt(process.env.MAX_PRODUCTS || "0", 10);
+const EMBEDDING_STAGGER_MS = 500; // 0.5s between embedding API calls
 
 async function main() {
   console.log("=".repeat(60));
-  console.log("  VIENEZE CLOTHING SCRAPER");
+  console.log("  VIENEZE CLOTHING SCRAPER — SMART MODE");
   console.log("=".repeat(60));
   console.log(`  Concurrency: ${CONCURRENCY}`);
   console.log(`  Delay: ${DELAY_MS}ms`);
   console.log(`  Max products: ${MAX_PRODUCTS > 0 ? MAX_PRODUCTS : "unlimited"}`);
+  console.log(`  Batch size: 50`);
   console.log("=".repeat(60));
 
-  // Step 0: Test connection
-  console.log("\n[Step 0] Testing Supabase connection...");
-  const connected = await testConnection();
+  // Validate environment early
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+    console.error("[FATAL] Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables.");
+    process.exit(1);
+  }
+
+  // ====================== Initialize ======================
+
+  console.log("\n[1/6] Testing Supabase connection...");
+  const db = new DatabaseManager();
+  const connected = await db.testConnection();
   if (!connected) {
     console.error("[FATAL] Cannot connect to Supabase. Aborting.");
     process.exit(1);
   }
-  console.log("[Step 0] Supabase connection OK ✓\n");
 
-  // Step 1: Initialize embeddings
-  console.log("[Step 1] Initializing SigLIP embedding models...");
-  console.log("[Step 1] This may take a moment (downloading model weights on first run)...");
-  await initEmbeddings();
-  console.log("[Step 1] Embedding models ready ✓\n");
+  console.log("\n[2/6] Fetching existing products from database...");
+  await db.fetchExisting();
 
-  // Step 2: Initialize scraper
-  console.log("[Step 2] Launching browser...");
+  console.log("\n[3/6] Launching browser & initializing embeddings...");
   const scraper = new VienzeScraper(CONCURRENCY, DELAY_MS);
   await scraper.init();
-  console.log("[Step 2] Browser ready ✓\n");
+
+  // Initialize embeddings early (model download happens here)
+  console.log("[Embeddings] Loading SigLIP model (may take a few minutes on first run)...");
+  await initEmbeddings();
+  console.log("[Embeddings] Model ready ✓");
 
   try {
-    // Step 3: Discover all product URLs
-    console.log("[Step 3] Discovering product URLs from all collections...");
+    // ====================== Discover URLs ======================
+
+    console.log("\n[4/6] Discovering product URLs...");
     const startTime = Date.now();
     const allUrls = await scraper.getAllProductUrls((page, url, count) => {
-      console.log(`  [Paginate] Page ${page} | ${url} | Total URLs: ${count}`);
+      console.log(`  [Paginate] Page ${page} | ${url} | Total: ${count}`);
     });
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[Step 3] Found ${allUrls.length} unique product URLs in ${elapsed}s ✓\n`);
+    console.log(`[Paginate] Found ${allUrls.length} URLs in ${elapsed}s ✓`);
 
     if (allUrls.length === 0) {
-      console.warn("[WARN] No product URLs found. Check the website structure.");
+      console.warn("[WARN] No products found.");
       return;
     }
 
-    // Apply max products limit if set
     const urlsToScrape =
       MAX_PRODUCTS > 0 ? allUrls.slice(0, MAX_PRODUCTS) : allUrls;
 
-    if (urlsToScrape.length < allUrls.length) {
-      console.log(
-        `  (Limited to ${urlsToScrape.length} products due to MAX_PRODUCTS setting)`
-      );
-    }
+    // Track which URLs were seen (for stale detection)
+    const seenUrls = new Set(urlsToScrape);
 
-    // Step 4: Scrape each product
-    console.log("\n[Step 4] Scraping product details...");
-    const results: RawProduct[] = [];
+    // ====================== Scrape Products ======================
+
+    console.log("\n[5/6] Scraping product details...");
+    const scrapedProducts: RawProduct[] = [];
 
     for (let i = 0; i < urlsToScrape.length; i += CONCURRENCY) {
       const chunk = urlsToScrape.slice(i, i + CONCURRENCY);
@@ -80,14 +92,11 @@ async function main() {
         try {
           const product = await scraper.scrapeProduct(url);
           if (product) {
-            console.log(
-              `  [Scrape] ✓ ${product.title} (${product.id})`
-            );
+            console.log(`  [Scrape] ✓ ${product.title}`);
             return product;
-          } else {
-            console.warn(`  [Scrape] ✗ Failed: ${url}`);
-            return null;
           }
+          console.warn(`  [Scrape] ✗ Failed: ${url}`);
+          return null;
         } catch (err) {
           console.error(`  [Scrape] ✗ Error: ${url}`, err);
           return null;
@@ -96,11 +105,11 @@ async function main() {
 
       const chunkResults = await Promise.all(promises);
       for (const r of chunkResults) {
-        if (r) results.push(r);
+        if (r) scrapedProducts.push(r);
       }
 
       console.log(
-        `  Progress: ${Math.min(i + CONCURRENCY, urlsToScrape.length)}/${urlsToScrape.length} products scraped`
+        `  Progress: ${Math.min(i + CONCURRENCY, urlsToScrape.length)}/${urlsToScrape.length}`
       );
 
       if (i + CONCURRENCY < urlsToScrape.length) {
@@ -108,69 +117,92 @@ async function main() {
       }
     }
 
-    console.log(
-      `\n[Step 4] Scraped ${results.length}/${urlsToScrape.length} products ✓\n`
-    );
+    console.log(`\n[Scrape] ${scrapedProducts.length}/${urlsToScrape.length} products scraped ✓`);
 
-    // Step 5: Generate embeddings and import to Supabase
-    console.log("[Step 5] Generating embeddings & importing to Supabase...\n");
-    let imported = 0;
-    let failed = 0;
+    // ====================== Compare & Classify ======================
 
-    for (let i = 0; i < results.length; i++) {
-      const product = results[i];
-      const progress = `[${i + 1}/${results.length}]`;
+    console.log("\n[6/6] Classifying products against database...");
+    const { decisions, needImageEmbedding, needTextEmbedding } =
+      db.processProducts(scrapedProducts);
 
-      console.log(`  ${progress} Processing: ${product.title}`);
+    const newCount = decisions.filter((d) => d.action === "new").length;
+    const changedCount = decisions.filter((d) => d.action === "changed").length;
+    const unchangedCount = decisions.filter((d) => d.action === "unchanged").length;
 
-      // Generate image embedding
-      console.log(`    → Generating image embedding...`);
-      const imageEmbedding = await getImageEmbedding(product.imageUrl);
+    console.log(`  🆕  New: ${newCount}`);
+    console.log(`  🔄  Changed: ${changedCount}`);
+    console.log(`  ⏭  Unchanged (skipped): ${unchangedCount}`);
+    console.log(`  🖼  Need image embeddings: ${needImageEmbedding.length}`);
+    console.log(`  📝  Need text embeddings: ${needTextEmbedding.length}`);
 
-      if (imageEmbedding) {
-        console.log(`    → Image embedding: ${imageEmbedding.length} dim ✓`);
-      } else {
-        console.warn(`    → Image embedding failed ✗`);
+    // ====================== Generate Embeddings ======================
+
+    // Only for products that need them
+    const embeddings = new Map<
+      string,
+      { image: number[] | null; text: number[] | null }
+    >();
+
+    // Image embeddings (with stagger)
+    if (needImageEmbedding.length > 0) {
+      console.log("\n[Embeddings] Generating image embeddings...");
+      for (let i = 0; i < needImageEmbedding.length; i++) {
+        const product = needImageEmbedding[i];
+        process.stdout.write(
+          `  [${i + 1}/${needImageEmbedding.length}] ${product.title}... `
+        );
+
+        const emb = await getImageEmbedding(product.imageUrl);
+        const existing = embeddings.get(product.productUrl) || { image: null, text: null };
+        existing.image = emb;
+        embeddings.set(product.productUrl, existing);
+
+        console.log(emb ? `✓` : `✗`);
+
+        if (i < needImageEmbedding.length - 1) {
+          await delay(EMBEDDING_STAGGER_MS);
+        }
       }
-
-      // Generate text embedding
-      console.log(`    → Generating text embedding...`);
-      const textEmbedding = await getTextEmbedding(product);
-
-      if (textEmbedding) {
-        console.log(`    → Text embedding: ${textEmbedding.length} dim ✓`);
-      } else {
-        console.warn(`    → Text embedding failed ✗`);
-      }
-
-      // Import to Supabase
-      console.log(`    → Importing to Supabase...`);
-      const success = await upsertProduct(product, imageEmbedding, textEmbedding);
-
-      if (success) {
-        imported++;
-        console.log(`    → Imported ✓`);
-      } else {
-        failed++;
-        console.error(`    → Import failed ✗`);
-      }
-
-      // Small delay between upserts to avoid rate limiting
-      await delay(200);
     }
 
-    // Final summary
-    console.log("\n" + "=".repeat(60));
-    console.log("  SCRAPING COMPLETE");
-    console.log("=".repeat(60));
-    console.log(`  Total URLs discovered: ${allUrls.length}`);
-    console.log(`  Products scraped: ${results.length}`);
-    console.log(`  Successfully imported: ${imported}`);
-    console.log(`  Failed: ${failed}`);
-    console.log("=".repeat(60));
+    // Text embeddings (with stagger)
+    if (needTextEmbedding.length > 0) {
+      console.log("\n[Embeddings] Generating text embeddings...");
+      for (let i = 0; i < needTextEmbedding.length; i++) {
+        const product = needTextEmbedding[i];
+        process.stdout.write(
+          `  [${i + 1}/${needTextEmbedding.length}] ${product.title}... `
+        );
+
+        const emb = await getTextEmbedding(product);
+        const existing = embeddings.get(product.productUrl) || { image: null, text: null };
+        existing.text = emb;
+        embeddings.set(product.productUrl, existing);
+
+        console.log(emb ? `✓` : `✗`);
+
+        if (i < needTextEmbedding.length - 1) {
+          await delay(EMBEDDING_STAGGER_MS);
+        }
+      }
+    }
+
+    // ====================== Batch Upsert ======================
+
+    console.log("\n[DB] Upserting products in batches of 50...");
+    await db.upsertAll(decisions, embeddings);
+
+    // ====================== Stale Product Cleanup ======================
+
+    await db.handleStaleProducts(seenUrls);
+
+    // ====================== Summary ======================
+
+    db.printSummary();
+    console.log(`\n[Done] Scraper finished.`);
   } finally {
     await scraper.close();
-    console.log("\nBrowser closed. Done.");
+    console.log("[Cleanup] Browser closed.");
   }
 }
 

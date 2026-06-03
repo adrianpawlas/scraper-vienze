@@ -1,39 +1,22 @@
+/** Raw scraped product data from the website */
 export interface RawProduct {
-  /** Shopify product ID (used as our unique id) */
   id: string;
-  /** Product page URL */
   productUrl: string;
-  /** Primary image URL (first image) */
   imageUrl: string;
-  /** Additional image URLs */
   additionalImages: string[];
-  /** Product title/name */
   title: string;
-  /** Product description (HTML or plain) */
   description: string;
-  /** Product category / type (e.g., "T-Shirts", "Sweaters") */
   category: string;
-  /** Gender: null, "unisex", "men", "women" */
   gender: string | null;
-  /** Original price (before any sale) – includes all available currencies */
   price: string;
-  /** Sale price – null if not on sale */
   sale: string | null;
-  /** Available sizes (comma-separated) */
   sizes: string;
-  /** Comma-separated tags */
   tags: string[];
-  /** Raw metadata JSON blob for everything else */
   metadata: Record<string, unknown>;
-  /** Whether the product is on sale */
   onSale: boolean;
-  /** Available currencies with prices */
   prices: PriceEntry[];
-  /** Sale prices per currency if on sale */
   salePrices: PriceEntry[] | null;
-  /** The Shopify product JSON for reference */
   shopifyData: Record<string, unknown>;
-  /** Country */
   country: string | null;
 }
 
@@ -43,16 +26,50 @@ export interface PriceEntry {
   formatted: string;
 }
 
-export interface ScrapedCollection {
-  url: string;
-  productUrls: string[];
-  pageNumber: number;
+/** A product record as stored in the Supabase "products" table */
+export interface DbProductRecord {
+  id: string;
+  source: string;
+  product_url: string;
+  image_url: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  gender: string | null;
+  price: string | null;
+  sale: string | null;
+  size: string | null;
+  tags: string[] | null;
+  additional_images: string | null;
+  metadata: string | null; // JSON string
+  country: string | null;
+  image_embedding: number[] | null;
+  info_embedding: number[] | null;
+  created_at: string | null;
+  [key: string]: unknown;
 }
 
-export interface ScraperProgress {
-  totalProductsFound: number;
-  currentPage: number;
-  currentCollection: string;
-  productsScraped: number;
-  productsImported: number;
+export interface ProductDecision {
+  product: RawProduct;
+  action: "new" | "changed" | "unchanged";
+  existingRecord: DbProductRecord | null;
+  /** Only set when action=CHANGED — which specific fields changed */
+  changedFields?: string[];
+}
+
+/** Batch upsert result */
+export interface BatchResult {
+  successCount: number;
+  failedCount: number;
+  failedProducts: Array<{ id: string; title: string; error: string }>;
+}
+
+/** Run summary printed at the end */
+export interface RunSummary {
+  totalSeen: number;
+  newProducts: number;
+  updatedProducts: number;
+  unchangedProducts: number;
+  staleDeleted: number;
+  failedProducts: number;
 }

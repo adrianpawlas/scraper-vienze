@@ -380,7 +380,7 @@ export class VienzeScraper {
       prices: [],
       salePrices: null,
       shopifyData: {},
-      country: "AT",
+      country: null,
     } as RawProduct;
   }
 
