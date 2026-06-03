@@ -1,0 +1,77 @@
+name: Vienze Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_products:
+        description: 'Max products to scrape (0 = unlimited)'
+        required: false
+        default: '0'
+        type: string
+  schedule:
+    - cron: '30 19 * * 1'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      TRANSFORMERS_CACHE: ~/.cache/@huggingface
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+
+      - name: Validate secrets
+        run: |
+          if [ -z "${{ secrets.SUPABASE_URL }}" ] || [ -z "${{ secrets.SUPABASE_SERVICE_KEY }}" ]; then
+            echo "::error::Missing Supabase secrets!"
+            echo "Please configure SUPABASE_URL and SUPABASE_SERVICE_KEY in your GitHub repo:"
+            echo "  Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "✓ Supabase secrets configured"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+
+      - name: Restore model cache
+        uses: actions/cache@v4
+        id: model-cache
+        with:
+          path: |
+            ~/.cache/@huggingface
+            ~/.cache/huggingface
+          key: huggingface-siglip-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            huggingface-siglip-${{ runner.os }}-
+            huggingface-siglip-
+
+      - name: Run scraper
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.max_products }}" != "0" ]]; then
+            MAX_PRODUCTS=${{ inputs.max_products }} npx tsx src/index.ts
+          else
+            npx tsx src/index.ts
+          fi
+
+      - name: Report summary
+        if: always()
+        run: |
+          echo "## Vienze Scraper Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Max products:** ${{ inputs.max_products || 'unlimited' }}" >> $GITHUB_STEP_SUMMARY
